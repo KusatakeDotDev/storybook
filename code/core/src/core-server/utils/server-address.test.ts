@@ -1,3 +1,5 @@
+import net from 'node:net';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import { logger } from 'storybook/internal/node-logger';
@@ -67,6 +69,41 @@ describe('getServerPort', () => {
     const result = await getServerPort(port);
 
     expect(result).toBe(expectedFreePort);
+  });
+
+  it('should look for a free port on the given host only', async () => {
+    vi.mocked(detectPort).mockResolvedValue(port);
+
+    await getServerPort(port, { host: '127.0.0.1' });
+
+    expect(detectPort).toHaveBeenCalledWith({ port, hostname: '127.0.0.1' });
+  });
+
+  it('should look for a free port on every host when no host is given', async () => {
+    vi.mocked(detectPort).mockResolvedValue(port);
+
+    await getServerPort(port);
+
+    expect(detectPort).toHaveBeenCalledWith({ port, hostname: undefined });
+  });
+
+  it('should reject without searching ports when the host cannot be listened on', async () => {
+    const listen = vi
+      .spyOn(net.Server.prototype, 'listen')
+      .mockImplementation(function (this: net.Server) {
+        const error = Object.assign(new Error('listen EADDRNOTAVAIL'), { code: 'EADDRNOTAVAIL' });
+        process.nextTick(() => this.emit('error', error));
+        return this;
+      });
+
+    try {
+      await expect(getServerPort(port, { host: '192.0.2.1' })).rejects.toThrow(
+        'Storybook could not listen on 192.0.2.1 (EADDRNOTAVAIL)'
+      );
+      expect(detectPort).not.toHaveBeenCalled();
+    } finally {
+      listen.mockRestore();
+    }
   });
 
   it('should reject with an actionable error when no port can be bound', async () => {

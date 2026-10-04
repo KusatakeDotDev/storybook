@@ -1,3 +1,4 @@
+import net from 'node:net';
 import os from 'node:os';
 
 import { SERVER_CHANNEL_PATH } from 'storybook/internal/channels';
@@ -31,10 +32,25 @@ export function getServerAddresses(
 
 interface PortOptions {
   exactPort?: boolean;
+  host?: string;
 }
 
-export const getServerPort = (port?: number, { exactPort }: PortOptions = {}) =>
-  detectFreePort(port)
+// detect-port never settles when given a hostname that nothing can be bound on.
+const assertCanListenOn = (host: string) =>
+  new Promise<void>((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, host, () => server.close(() => resolve()));
+  });
+
+export const getServerPort = async (port?: number, { exactPort, host }: PortOptions = {}) => {
+  if (host) {
+    await assertCanListenOn(host).catch((error: NodeJS.ErrnoException) => {
+      throw new NoFreePortError({ requestedPort: port, host, code: error.code });
+    });
+  }
+
+  return detectFreePort({ port, hostname: host })
     .catch((error) => {
       logger.error(error);
       process.exit(-1);
@@ -53,6 +69,7 @@ export const getServerPort = (port?: number, { exactPort }: PortOptions = {}) =>
       }
       return freePort;
     });
+};
 
 export const getServerChannelUrl = (port: number, { https }: { https?: boolean }) => {
   return `${https ? 'wss' : 'ws'}://localhost:${port}${SERVER_CHANNEL_PATH}`;
