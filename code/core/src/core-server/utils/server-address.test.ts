@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import net from 'node:net';
 
 import { describe, expect, it, vi } from 'vitest';
@@ -17,6 +18,20 @@ vi.mock('node:os', () => ({
 }));
 vi.mock('detect-port');
 vi.mock('storybook/internal/node-logger');
+
+const stubLoopbackListeners = (listeningPorts: number[]) =>
+  vi.spyOn(net, 'connect').mockImplementation(((options: net.TcpNetConnectOpts) => {
+    const socket = Object.assign(new EventEmitter(), { destroy: () => socket });
+    process.nextTick(() =>
+      listeningPorts.includes(options.port)
+        ? socket.emit('connect')
+        : socket.emit(
+            'error',
+            Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+          )
+    );
+    return socket;
+  }) as unknown as typeof net.connect);
 
 describe('getServerAddresses', () => {
   const port = 3000;
@@ -72,11 +87,32 @@ describe('getServerPort', () => {
   });
 
   it('should look for a free port on the given host only', async () => {
+    const connect = stubLoopbackListeners([]);
     vi.mocked(detectPort).mockResolvedValue(port);
 
-    await getServerPort(port, { host: '127.0.0.1' });
+    try {
+      await getServerPort(port, { host: '127.0.0.1' });
 
-    expect(detectPort).toHaveBeenCalledWith({ port, hostname: '127.0.0.1' });
+      expect(detectPort).toHaveBeenCalledWith({ port, hostname: '127.0.0.1' });
+    } finally {
+      connect.mockRestore();
+    }
+  });
+
+  it('should skip a port that another process listens on through a different address', async () => {
+    const connect = stubLoopbackListeners([port]);
+    vi.mocked(detectPort)
+      .mockResolvedValueOnce(port)
+      .mockResolvedValueOnce(port + 1);
+
+    try {
+      const result = await getServerPort(port, { host: '127.0.0.1' });
+
+      expect(result).toBe(port + 1);
+      expect(detectPort).toHaveBeenLastCalledWith({ port: port + 1, hostname: '127.0.0.1' });
+    } finally {
+      connect.mockRestore();
+    }
   });
 
   it('should look for a free port on every host when no host is given', async () => {

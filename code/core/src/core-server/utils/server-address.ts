@@ -43,6 +43,31 @@ const assertCanListenOn = (host: string) =>
     server.listen(0, host, () => server.close(() => resolve()));
   });
 
+// Windows lets a bind on one address succeed while another process listens on the wildcard or
+// the other loopback address, so a successful bind on the host alone does not prove the port free.
+const isPortInUse = (port: number) =>
+  Promise.all(
+    ['127.0.0.1', '::1'].map(
+      (address) =>
+        new Promise<boolean>((resolve) => {
+          const socket = net.connect({ port, host: address });
+          socket.once('connect', () => {
+            socket.destroy();
+            resolve(true);
+          });
+          socket.once('error', () => resolve(false));
+        })
+    )
+  ).then((results) => results.includes(true));
+
+const findFreePort = async (port: number | undefined, host: string | undefined) => {
+  let freePort = await detectFreePort({ port, hostname: host });
+  while (host && freePort && (await isPortInUse(freePort))) {
+    freePort = await detectFreePort({ port: freePort + 1, hostname: host });
+  }
+  return freePort;
+};
+
 export const getServerPort = async (port?: number, { exactPort, host }: PortOptions = {}) => {
   if (host) {
     await assertCanListenOn(host).catch((error: NodeJS.ErrnoException) => {
@@ -50,7 +75,7 @@ export const getServerPort = async (port?: number, { exactPort, host }: PortOpti
     });
   }
 
-  return detectFreePort({ port, hostname: host })
+  return findFreePort(port, host)
     .catch((error) => {
       logger.error(error);
       process.exit(-1);
