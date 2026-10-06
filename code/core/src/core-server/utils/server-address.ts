@@ -3,9 +3,7 @@ import os from 'node:os';
 
 import { SERVER_CHANNEL_PATH } from 'storybook/internal/channels';
 import { logger } from 'storybook/internal/node-logger';
-import { NoFreePortError } from 'storybook/internal/server-errors';
-
-import detectFreePort from 'detect-port';
+import { NoFreePortError, UnavailableHostError } from 'storybook/internal/server-errors';
 
 export function getServerAddresses(
   port: number,
@@ -35,65 +33,77 @@ interface PortOptions {
   host?: string;
 }
 
-// detect-port never settles when given a hostname that nothing can be bound on.
-const assertCanListenOn = (host: string) =>
-  new Promise<void>((resolve, reject) => {
+const bindPort = (port: number, host: string | undefined) =>
+  new Promise<number | undefined>((resolve, reject) => {
     const server = net.createServer();
-    server.once('error', reject);
-    server.listen(0, host, () => server.close(() => resolve()));
+    server.once('error', (error: NodeJS.ErrnoException) =>
+      // Privileged ports and the port ranges Windows reserves fail with EACCES.
+      error.code === 'EADDRINUSE' || error.code === 'EACCES' ? resolve(undefined) : reject(error)
+    );
+    server.listen(port, host, () => {
+      const { port: boundPort } = server.address() as net.AddressInfo;
+      server.close(() => resolve(boundPort));
+    });
   });
 
-// Windows lets a bind on one address succeed while another process listens on the wildcard or
-// the other loopback address, so a successful bind on the host alone does not prove the port free.
-const isPortInUse = (port: number) =>
-  Promise.all(
-    ['127.0.0.1', '::1'].map(
-      (address) =>
-        new Promise<boolean>((resolve) => {
-          const socket = net.connect({ port, host: address });
-          socket.once('connect', () => {
-            socket.destroy();
-            resolve(true);
-          });
-          socket.once('error', () => resolve(false));
-        })
-    )
-  ).then((results) => results.includes(true));
+const answers = (port: number, host: string) =>
+  new Promise<boolean>((resolve) => {
+    const socket = net.connect({ port, host, timeout: 250 });
+    const settle = (served: boolean) => {
+      socket.destroy();
+      resolve(served);
+    };
+    socket.once('connect', () => settle(true));
+    socket.once('timeout', () => settle(false));
+    socket.once('error', () => settle(false));
+  });
 
-const findFreePort = async (port: number | undefined, host: string | undefined) => {
-  let freePort = await detectFreePort({ port, hostname: host });
-  while (host && freePort && (await isPortInUse(freePort))) {
-    freePort = await detectFreePort({ port: freePort + 1, hostname: host });
+// A bind succeeds next to another process serving the port on a different address (::1 beside
+// 127.0.0.1, and any address on Windows), so also check the addresses Storybook prints.
+// Connecting to the network address is refused only after ~2s on Windows, so bind it instead.
+const tryPort = async (port: number, host: string | undefined) => {
+  const boundPort = await bindPort(port, host);
+  if (boundPort === undefined) {
+    return undefined;
   }
-  return freePort;
+  const isWildcard = !host || host === '0.0.0.0' || host === '::';
+  if (isWildcard && (await bindPort(boundPort, getLocalIp())) === undefined) {
+    return undefined;
+  }
+  const loopback = await Promise.all([answers(boundPort, '127.0.0.1'), answers(boundPort, '::1')]);
+  return loopback.includes(true) ? undefined : boundPort;
 };
 
 export const getServerPort = async (port?: number, { exactPort, host }: PortOptions = {}) => {
-  if (host) {
-    await assertCanListenOn(host).catch((error: NodeJS.ErrnoException) => {
-      throw new NoFreePortError({ requestedPort: port, host, code: error.code });
-    });
-  }
+  const candidates = !port
+    ? []
+    : exactPort
+      ? [port]
+      : Array.from({ length: Math.min(10, 65536 - port) }, (_, offset) => port + offset);
 
-  return findFreePort(port, host)
-    .catch((error) => {
-      logger.error(error);
+  try {
+    for (const candidate of candidates) {
+      const freePort = await tryPort(candidate, host);
+      if (freePort) {
+        return freePort;
+      }
+    }
+    if (exactPort && port) {
+      logger.error(`Port ${port} is not available. Exiting because --exact-port was provided.`);
       process.exit(-1);
-    })
-    .then((freePort) => {
-      // detect-port resolves `undefined` instead of rejecting when the environment refuses
-      // every bind attempt, e.g. sandboxed shells that deny listening on network ports.
-      // Throwing (instead of exiting) lets `storybook dev` report the error through telemetry
-      // and lets `storybook init`, which probes for a port opportunistically, recover from it.
-      if (!freePort) {
-        throw new NoFreePortError({ requestedPort: port });
-      }
-      if (exactPort && port != null && freePort !== port) {
-        logger.error(`Port ${port} is not available. Exiting because --exact-port was provided.`);
-        process.exit(-1);
-      }
+    }
+    const freePort = await tryPort(0, host);
+    if (freePort) {
       return freePort;
-    });
+    }
+  } catch (error) {
+    const { code } = error as NodeJS.ErrnoException;
+    if (host && (code === 'EADDRNOTAVAIL' || code === 'ENOTFOUND')) {
+      throw new UnavailableHostError({ host, code });
+    }
+    throw new NoFreePortError({ requestedPort: port, code });
+  }
+  throw new NoFreePortError({ requestedPort: port });
 };
 
 export const getServerChannelUrl = (port: number, { https }: { https?: boolean }) => {

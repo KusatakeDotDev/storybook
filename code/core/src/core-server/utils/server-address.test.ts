@@ -1,37 +1,80 @@
 import { EventEmitter } from 'node:events';
 import net from 'node:net';
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { logger } from 'storybook/internal/node-logger';
-
-import detectPort from 'detect-port';
 
 import { getServerAddresses, getServerChannelUrl, getServerPort } from './server-address.ts';
 
 vi.mock('node:os', () => ({
-  default: { release: () => '' },
+  default: {
+    release: () => '',
+    networkInterfaces: () => ({
+      eth0: [{ address: '192.168.0.10', family: 'IPv4', internal: false }],
+    }),
+  },
   platform: 'darwin',
   constants: {
     signals: {},
   },
 }));
-vi.mock('detect-port');
 vi.mock('storybook/internal/node-logger');
 
-const stubLoopbackListeners = (listeningPorts: number[]) =>
+const OS_PICKED_PORT = 61000;
+
+const errorWithCode = (code: string) => Object.assign(new Error(code), { code });
+
+const fakeNetwork = ({
+  taken = {},
+  serving = {},
+  unresponsive = [],
+  bindError,
+}: {
+  taken?: Record<string, number[]>;
+  serving?: Record<string, number[]>;
+  unresponsive?: string[];
+  bindError?: string;
+} = {}) => {
+  const listen = vi.fn();
+
+  vi.spyOn(net, 'createServer').mockImplementation((() => {
+    let boundPort = 0;
+    const server = Object.assign(new EventEmitter(), {
+      listen: (port: number, host: string | undefined, onListening: () => void) => {
+        listen(port, host);
+        const code = bindError ?? (taken[host ?? '::']?.includes(port) ? 'EADDRINUSE' : undefined);
+        boundPort = port || OS_PICKED_PORT;
+        process.nextTick(() => (code ? server.emit('error', errorWithCode(code)) : onListening()));
+        return server;
+      },
+      address: () => ({ port: boundPort }),
+      close: (onClose: () => void) => onClose(),
+    });
+    return server;
+  }) as unknown as typeof net.createServer);
+
   vi.spyOn(net, 'connect').mockImplementation(((options: net.TcpNetConnectOpts) => {
     const socket = Object.assign(new EventEmitter(), { destroy: () => socket });
-    process.nextTick(() =>
-      listeningPorts.includes(options.port)
-        ? socket.emit('connect')
-        : socket.emit(
-            'error',
-            Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
-          )
-    );
+    const host = options.host ?? '';
+    process.nextTick(() => {
+      if (unresponsive.includes(host)) {
+        socket.emit('timeout');
+      } else if (serving[host]?.includes(options.port)) {
+        socket.emit('connect');
+      } else {
+        socket.emit('error', errorWithCode('ECONNREFUSED'));
+      }
+    });
     return socket;
   }) as unknown as typeof net.connect);
+
+  return { listen };
+};
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('getServerAddresses', () => {
   const port = 3000;
@@ -76,110 +119,97 @@ describe('getServerAddresses', () => {
 describe('getServerPort', () => {
   const port = 3000;
 
-  it('should resolve with a free port', async () => {
-    const expectedFreePort = 4000;
+  it('should resolve with the requested port when it is free', async () => {
+    fakeNetwork();
 
-    vi.mocked(detectPort).mockResolvedValue(expectedFreePort);
-
-    const result = await getServerPort(port);
-
-    expect(result).toBe(expectedFreePort);
+    expect(await getServerPort(port)).toBe(port);
   });
 
-  it('should look for a free port on the given host only', async () => {
-    const connect = stubLoopbackListeners([]);
-    vi.mocked(detectPort).mockResolvedValue(port);
+  it('should move to the next port when the requested port is taken', async () => {
+    fakeNetwork({ taken: { '::': [port] } });
 
-    try {
-      await getServerPort(port, { host: '127.0.0.1' });
+    expect(await getServerPort(port)).toBe(port + 1);
+  });
 
-      expect(detectPort).toHaveBeenCalledWith({ port, hostname: '127.0.0.1' });
-    } finally {
-      connect.mockRestore();
+  it.each([
+    { host: undefined, address: '127.0.0.1' },
+    { host: '127.0.0.1', address: '::1' },
+  ])(
+    'should skip a port another process serves on $address when the host is $host',
+    async ({ host, address }) => {
+      fakeNetwork({ serving: { [address]: [port] } });
+
+      expect(await getServerPort(port, { host })).toBe(port + 1);
     }
+  );
+
+  it('should skip a port another process holds on the network address when listening on every address', async () => {
+    fakeNetwork({ taken: { '192.168.0.10': [port] } });
+
+    expect(await getServerPort(port, { host: '0.0.0.0' })).toBe(port + 1);
   });
 
-  it('should skip a port that another process listens on through a different address', async () => {
-    const connect = stubLoopbackListeners([port]);
-    vi.mocked(detectPort)
-      .mockResolvedValueOnce(port)
-      .mockResolvedValueOnce(port + 1);
+  it('should listen on the given host only', async () => {
+    const { listen } = fakeNetwork();
 
-    try {
-      const result = await getServerPort(port, { host: '127.0.0.1' });
+    await getServerPort(port, { host: '127.0.0.1' });
 
-      expect(result).toBe(port + 1);
-      expect(detectPort).toHaveBeenLastCalledWith({ port: port + 1, hostname: '127.0.0.1' });
-    } finally {
-      connect.mockRestore();
-    }
+    expect(new Set(listen.mock.calls.map(([, host]) => host))).toEqual(new Set(['127.0.0.1']));
   });
 
-  it('should look for a free port on every host when no host is given', async () => {
-    vi.mocked(detectPort).mockResolvedValue(port);
+  it('should treat a localhost address that never answers as free', async () => {
+    fakeNetwork({ unresponsive: ['::1'] });
 
-    await getServerPort(port);
-
-    expect(detectPort).toHaveBeenCalledWith({ port, hostname: undefined });
+    expect(await getServerPort(port)).toBe(port);
   });
 
-  it('should reject without searching ports when the host cannot be listened on', async () => {
-    const listen = vi
-      .spyOn(net.Server.prototype, 'listen')
-      .mockImplementation(function (this: net.Server) {
-        const error = Object.assign(new Error('listen EADDRNOTAVAIL'), { code: 'EADDRNOTAVAIL' });
-        process.nextTick(() => this.emit('error', error));
-        return this;
-      });
+  it('should let the OS pick a port when the next ten ports are taken', async () => {
+    fakeNetwork({ taken: { '::': Array.from({ length: 10 }, (_, offset) => port + offset) } });
 
-    try {
-      await expect(getServerPort(port, { host: '192.0.2.1' })).rejects.toThrow(
-        'Storybook could not listen on 192.0.2.1 (EADDRNOTAVAIL)'
-      );
-      expect(detectPort).not.toHaveBeenCalled();
-    } finally {
-      listen.mockRestore();
-    }
+    expect(await getServerPort(port)).toBe(OS_PICKED_PORT);
   });
 
-  it('should reject with an actionable error when no port can be bound', async () => {
-    // detect-port resolves `undefined` instead of rejecting when the environment
-    // refuses every bind attempt (e.g. sandboxed shells).
-    vi.mocked(detectPort).mockResolvedValue(undefined as unknown as number);
+  it('should not look past port 65535', async () => {
+    const { listen } = fakeNetwork({ taken: { '::': [65535] } });
+
+    expect(await getServerPort(65535)).toBe(OS_PICKED_PORT);
+    expect(listen).not.toHaveBeenCalledWith(65536, undefined);
+  });
+
+  it('should reject with an actionable error when the host is not an address of this machine', async () => {
+    fakeNetwork({ bindError: 'EADDRNOTAVAIL' });
+
+    await expect(getServerPort(port, { host: '192.0.2.1' })).rejects.toThrow(
+      "Storybook's dev server cannot listen on 192.0.2.1 (EADDRNOTAVAIL)"
+    );
+  });
+
+  it('should reject with an actionable error when the environment refuses to listen', async () => {
+    fakeNetwork({ bindError: 'EPERM' });
 
     await expect(getServerPort(port)).rejects.toThrow(
-      "Unable to find a free port for Storybook's dev server"
+      'Your environment appears to block Storybook from listening on network ports (EPERM)'
     );
   });
 
   it('should log an error and exit when the port is taken and exactPort is set', async () => {
-    vi.mocked(detectPort).mockResolvedValue(4000);
+    fakeNetwork({ taken: { '::': [port] } });
     const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as () => never);
 
-    try {
-      await getServerPort(port, { exactPort: true });
+    await getServerPort(port, { exactPort: true });
 
-      expect(logger.error).toHaveBeenCalledWith(
-        `Port ${port} is not available. Exiting because --exact-port was provided.`
-      );
-      expect(exit).toHaveBeenCalledWith(-1);
-    } finally {
-      exit.mockRestore();
-    }
+    expect(logger.error).toHaveBeenCalledWith(
+      `Port ${port} is not available. Exiting because --exact-port was provided.`
+    );
+    expect(exit).toHaveBeenCalledWith(-1);
   });
 
   it('should not exit for exactPort when no port was requested', async () => {
-    vi.mocked(detectPort).mockResolvedValue(4000);
+    fakeNetwork();
     const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as () => never);
 
-    try {
-      const result = await getServerPort(undefined, { exactPort: true });
-
-      expect(result).toBe(4000);
-      expect(exit).not.toHaveBeenCalled();
-    } finally {
-      exit.mockRestore();
-    }
+    expect(await getServerPort(undefined, { exactPort: true })).toBe(OS_PICKED_PORT);
+    expect(exit).not.toHaveBeenCalled();
   });
 });
 

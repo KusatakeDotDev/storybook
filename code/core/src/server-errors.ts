@@ -834,7 +834,7 @@ export class StatusTypeIdMismatchError extends StorybookError {
 }
 
 export class NoFreePortError extends StorybookError {
-  constructor(public data: { requestedPort?: number; host?: string; code?: string }) {
+  constructor(public data: { requestedPort?: number; code?: string }) {
     super({
       name: 'NoFreePortError',
       category: Category.CORE_SERVER,
@@ -842,7 +842,7 @@ export class NoFreePortError extends StorybookError {
       code: 18,
       message: dedent`
         Unable to find a free port for Storybook's dev server${data.requestedPort ? ` (requested port: ${data.requestedPort})` : ''}.
-        ${data.host ? `Storybook could not listen on ${data.host}${data.code ? ` (${data.code})` : ''}. Check that --host is an address of this machine.` : 'Your environment appears to block Storybook from listening on network ports.'}
+        Your environment appears to block Storybook from listening on network ports${data.code ? ` (${data.code})` : ''}.
         If you are running Storybook in a sandboxed or restricted shell, allow binding to localhost ports and try again.`,
     });
   }
@@ -858,6 +858,19 @@ export class StorybookDevServerDisconnectedError extends StorybookError {
         Storybook dev server disconnected${data.code ? ` (close code ${data.code}${data.reason ? `: ${data.reason}` : ''})` : ''}.
         Any request that was still in flight has been abandoned.
         Make sure the dev server is still running, then try again.`,
+    });
+  }
+}
+
+export class UnavailableHostError extends StorybookError {
+  constructor(public data: { host: string; code: string }) {
+    super({
+      name: 'UnavailableHostError',
+      category: Category.CORE_SERVER,
+      code: 20,
+      message: dedent`
+        Storybook's dev server cannot listen on ${data.host} (${data.code}).
+        Set the host to a name or IP address of this machine.`,
     });
   }
 }
